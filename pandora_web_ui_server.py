@@ -9,13 +9,16 @@ Stil eines Datei-Explorers ausliefert:
     - Links: ein aufklappbarer Ordnerbaum (lazy-loaded per AJAX)
     - Rechts: Kachel-/Listenansicht der aktuellen Verzeichnisinhalte
       mit Icons, Dateigröße, Änderungsdatum, Sortierung und Live-Filter
+    - Drag & Drop-Upload: Dateien vom Client-PC direkt in den Browser
+      ziehen, um sie in das aktuell angezeigte Verzeichnis hochzuladen
 
 Die eigentliche Dateiauslieferung (Download, Range-Requests, MIME-Type-
 Erkennung) bleibt 1:1 die von ``http.server.SimpleHTTPRequestHandler``
 geerbte Standard-Logik inkl. deren eingebautem Pfad-Traversal-Schutz
 (``translate_path``). Es wird ausschließlich ``list_directory()``
-überschrieben und ein schlanker JSON-Endpunkt für den Ordnerbaum
-ergänzt.
+überschrieben und um einen JSON-Endpunkt für den Ordnerbaum sowie einen
+``POST``-Endpunkt für den Datei-Upload (multipart/form-data, per
+Hand geparst - ohne das veraltete ``cgi``-Modul) ergänzt.
 
 Wird von ``server_worker.py`` als Subprozess gestartet, genau wie
 vorher ``python -m http.server`` - Kommandozeilen-Argumente:
@@ -100,6 +103,159 @@ class PandoraExplorerHandler(SimpleHTTPRequestHandler):
             self._serve_children_json(parsed.path)
             return
         super().do_GET()
+
+    # ------------------------------------------------------------------
+    # Datei-Upload (Drag & Drop vom Client-Browser)
+    # ------------------------------------------------------------------
+    #: Sicherheitslimit pro Upload-Anfrage (Summe aller enthaltenen
+    #: Dateien). Verhindert, dass eine einzelne Anfrage den Server-
+    #: Prozess durch übermäßigen Speicherbedarf lahmlegt.
+    MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+    def do_POST(self):  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        target_dir = self.translate_path(parsed.path)
+
+        if not os.path.isdir(target_dir):
+            self._json_response(404, {"error": "Zielordner nicht gefunden."})
+            return
+
+        content_type = self.headers.get("Content-Type", "")
+        if not content_type.startswith("multipart/form-data"):
+            self._json_response(400, {"error": "Erwartet wird multipart/form-data."})
+            return
+
+        boundary = self._extract_boundary(content_type)
+        if not boundary:
+            self._json_response(400, {"error": "Boundary im Content-Type fehlt."})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._json_response(400, {"error": "Ungültige Content-Length."})
+            return
+
+        if length <= 0:
+            self._json_response(400, {"error": "Leere Anfrage."})
+            return
+        if length > self.MAX_UPLOAD_BYTES:
+            self._json_response(
+                413, {"error": f"Upload zu groß (Limit {_human_size(self.MAX_UPLOAD_BYTES)} pro Anfrage)."}
+            )
+            return
+
+        body = self.rfile.read(length)
+
+        try:
+            files = self._parse_multipart_files(body, boundary)
+        except ValueError as exc:
+            self._json_response(400, {"error": f"Multipart-Daten fehlerhaft: {exc}"})
+            return
+
+        saved, skipped, errors = [], [], []
+        for raw_name, data in files:
+            # Nur den reinen Dateinamen übernehmen - schützt zusätzlich zum
+            # ererbten translate_path()-Schutz auch gegen Pfadanteile
+            # innerhalb des Dateinamens selbst (z. B. "../../evil.sh").
+            safe_name = os.path.basename(raw_name.replace("\\", "/")).strip()
+            if not safe_name or safe_name in (".", ".."):
+                skipped.append(raw_name or "(unbenannt)")
+                continue
+            try:
+                dest_path = self._unique_destination(target_dir, safe_name)
+                with open(dest_path, "wb") as fh:
+                    fh.write(data)
+                saved.append(os.path.basename(dest_path))
+            except OSError as exc:
+                errors.append(f"{safe_name}: {exc}")
+
+        if saved and not errors and not skipped:
+            status = 200
+        elif saved:
+            status = 207  # Multi-Status: teilweiser Erfolg
+        else:
+            status = 400
+        self._json_response(status, {"saved": saved, "skipped": skipped, "errors": errors})
+
+    def _extract_boundary(self, content_type: str) -> bytes | None:
+        for part in content_type.split(";")[1:]:
+            part = part.strip()
+            if part.startswith("boundary="):
+                value = part[len("boundary="):]
+                if value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+                return value.encode("utf-8")
+        return None
+
+    def _parse_multipart_files(self, body: bytes, boundary: bytes):
+        """Zerlegt einen multipart/form-data-Body in (Dateiname, Bytes)-Paare.
+
+        Bewusst als schlanker Hand-Parser umgesetzt statt über das seit
+        Python 3.13 entfernte ``cgi``-Modul, damit das Skript ohne externe
+        Abhängigkeiten und versionsunabhängig lauffähig bleibt. Formularfelder
+        ohne ``filename`` (also keine echten Dateien) werden ignoriert.
+        """
+        delimiter = b"--" + boundary
+        if delimiter not in body:
+            raise ValueError("Boundary im Body nicht gefunden")
+
+        segments = body.split(delimiter)
+        results = []
+        for segment in segments:
+            if not segment or segment in (b"--\r\n", b"--", b"\r\n"):
+                continue
+            segment = segment[2:] if segment[:2] == b"\r\n" else segment
+            if segment.startswith(b"--"):
+                continue  # abschließender Delimiter der gesamten Anfrage
+
+            header_end = segment.find(b"\r\n\r\n")
+            if header_end == -1:
+                continue
+            header_text = segment[:header_end].decode("utf-8", errors="replace")
+            data = segment[header_end + 4:]
+            if data.endswith(b"\r\n"):
+                data = data[:-2]
+
+            filename = None
+            for line in header_text.split("\r\n"):
+                lower = line.lower()
+                if lower.startswith("content-disposition") and "filename=" in lower:
+                    marker = "filename=\""
+                    start = lower.find(marker)
+                    if start == -1:
+                        continue
+                    start += len(marker)
+                    end = line.find('"', start)
+                    if end == -1:
+                        continue
+                    filename = line[start:end]
+
+            if filename:
+                results.append((filename, data))
+        return results
+
+    def _unique_destination(self, directory: str, name: str) -> str:
+        """Verhindert stilles Überschreiben: hängt bei Namenskollision
+        ``(1)``, ``(2)``, … vor die Dateiendung an (wie im Explorer)."""
+        dest = os.path.join(directory, name)
+        if not os.path.exists(dest):
+            return dest
+        base, ext = os.path.splitext(name)
+        counter = 1
+        while True:
+            candidate = os.path.join(directory, f"{base} ({counter}){ext}")
+            if not os.path.exists(candidate):
+                return candidate
+            counter += 1
+
+    def _json_response(self, status: int, payload: dict) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     # ------------------------------------------------------------------
     # JSON-API für den lazy-geladenen Ordnerbaum
@@ -201,7 +357,7 @@ class PandoraExplorerHandler(SimpleHTTPRequestHandler):
 <style>{_CSS}</style>
 </head>
 <body>
-<div class="app">
+<div class="app" id="pandoraApp" data-current-dir="{html.escape(url_path)}">
   <aside class="sidebar">
     <div class="brand">📦 <span>Pandora<sup>®</sup></span></div>
     <div class="tree-scroll">
@@ -222,6 +378,7 @@ class PandoraExplorerHandler(SimpleHTTPRequestHandler):
       {self._render_sort_link("Name", "name", sort_key, order, url_path)}
       {self._render_sort_link("Größe", "size", sort_key, order, url_path)}
       {self._render_sort_link("Datum", "date", sort_key, order, url_path)}
+      <span class="upload-hint">⬇️ Dateien per Drag &amp; Drop hier ablegen zum Hochladen</span>
     </div>
     {up_link}
     <div id="explorer" class="explorer grid">
@@ -231,6 +388,10 @@ class PandoraExplorerHandler(SimpleHTTPRequestHandler):
       {total_dirs} Ordner · {total_files} Dateien · {_human_size(total_size)} gesamt
     </footer>
   </main>
+  <div id="dropOverlay" class="drop-overlay">
+    <div class="drop-box">📥 Dateien hier ablegen<br><span>Upload nach /{html.escape(rel_dir)}</span></div>
+  </div>
+  <div id="uploadPanel" class="upload-panel"></div>
 </div>
 <script>{_JS}</script>
 </body>
@@ -472,6 +633,43 @@ ul.tree { padding-left: 0; }
     border-top: 1px solid var(--border); background: var(--bg-alt);
     padding: 8px 20px; font-size: 12px; color: var(--text-dim);
 }
+.upload-hint { margin-left: auto; color: var(--text-dim); font-size: 11px; opacity: .8; }
+
+/* Drag&Drop-Overlay: liegt über der gesamten App, wird nur während des
+   Ziehens von Dateien über das Fenster sichtbar. */
+.drop-overlay {
+    position: fixed; inset: 0; z-index: 50; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(18, 11, 13, 0.88);
+    border: 3px dashed var(--accent);
+}
+.drop-overlay.active { display: flex; }
+.drop-box {
+    text-align: center; font-size: 22px; color: var(--text);
+    padding: 40px 60px; border-radius: 12px; background: var(--panel);
+    box-shadow: var(--glow);
+}
+.drop-box span { font-size: 13px; color: var(--text-dim); }
+
+/* Upload-Fortschritts-Panel unten rechts */
+.upload-panel {
+    position: fixed; right: 20px; bottom: 20px; z-index: 60;
+    display: flex; flex-direction: column; gap: 8px; max-width: 320px;
+}
+.upload-item {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-size: 12px; color: var(--text);
+}
+.upload-item .upload-name { display: flex; justify-content: space-between; margin-bottom: 6px; word-break: break-all; }
+.upload-item .upload-bar-track {
+    background: var(--bg); border-radius: 4px; height: 6px; overflow: hidden;
+}
+.upload-item .upload-bar-fill {
+    background: var(--accent); height: 100%; width: 0%; transition: width .15s;
+}
+.upload-item.done .upload-bar-fill { background: #4ade80; width: 100%; }
+.upload-item.error .upload-bar-fill { background: #f87171; width: 100%; }
+.upload-item .upload-status { margin-top: 4px; color: var(--text-dim); font-size: 11px; }
 """
 
 _JS = """
@@ -535,6 +733,140 @@ function pandoraToggle(span) {
         span.textContent = '▸';
     });
 }
+
+/* ------------------------------------------------------------------
+ * Drag & Drop-Upload: Dateien vom Client-PC in den aktuell angezeigten
+ * Ordner ziehen. Ordner-Drops werden erkannt und mit Hinweis
+ * übersprungen (nur einzelne Dateien werden unterstützt).
+ * ------------------------------------------------------------------ */
+(function () {
+    var appEl = document.getElementById('pandoraApp');
+    var overlay = document.getElementById('dropOverlay');
+    var panel = document.getElementById('uploadPanel');
+    if (!appEl || !overlay || !panel) { return; }
+
+    var currentDir = appEl.getAttribute('data-current-dir') || '/';
+    var dragCounter = 0;
+    var pendingUploads = 0;
+    var anySuccess = false;
+
+    function hasFiles(e) {
+        return e.dataTransfer && e.dataTransfer.types &&
+            Array.prototype.indexOf.call(e.dataTransfer.types, 'Files') !== -1;
+    }
+
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(function (evt) {
+        window.addEventListener(evt, function (e) { e.preventDefault(); e.stopPropagation(); }, false);
+    });
+
+    window.addEventListener('dragenter', function (e) {
+        if (!hasFiles(e)) { return; }
+        dragCounter++;
+        overlay.classList.add('active');
+    });
+    window.addEventListener('dragleave', function () {
+        dragCounter = Math.max(0, dragCounter - 1);
+        if (dragCounter === 0) { overlay.classList.remove('active'); }
+    });
+    window.addEventListener('drop', function (e) {
+        dragCounter = 0;
+        overlay.classList.remove('active');
+        if (hasFiles(e)) { handleDrop(e.dataTransfer); }
+    });
+
+    function handleDrop(dataTransfer) {
+        var files = [];
+        var rejectedFolders = 0;
+
+        if (dataTransfer.items && dataTransfer.items.length && dataTransfer.items[0].webkitGetAsEntry) {
+            for (var i = 0; i < dataTransfer.items.length; i++) {
+                var entry = dataTransfer.items[i].webkitGetAsEntry ? dataTransfer.items[i].webkitGetAsEntry() : null;
+                if (entry && entry.isDirectory) {
+                    rejectedFolders++;
+                } else {
+                    var f = dataTransfer.items[i].getAsFile ? dataTransfer.items[i].getAsFile() : null;
+                    if (f) { files.push(f); }
+                }
+            }
+        } else if (dataTransfer.files) {
+            for (var j = 0; j < dataTransfer.files.length; j++) { files.push(dataTransfer.files[j]); }
+        }
+
+        if (rejectedFolders > 0) {
+            pandoraNotify('⚠️ ' + rejectedFolders + ' Ordner übersprungen – nur einzelne Dateien werden unterstützt.', true);
+        }
+        files.forEach(uploadFile);
+    }
+
+    function uploadFile(file) {
+        pendingUploads++;
+
+        var item = document.createElement('div');
+        item.className = 'upload-item';
+        item.innerHTML =
+            '<div class="upload-name"><span></span><span class="upload-pct">0%</span></div>' +
+            '<div class="upload-bar-track"><div class="upload-bar-fill"></div></div>' +
+            '<div class="upload-status">Wird hochgeladen…</div>';
+        item.querySelector('.upload-name span').textContent = file.name;
+        panel.appendChild(item);
+
+        var fill = item.querySelector('.upload-bar-fill');
+        var pct = item.querySelector('.upload-pct');
+        var status = item.querySelector('.upload-status');
+
+        var formData = new FormData();
+        formData.append('files', file, file.name);
+
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', currentDir, true);
+        xhr.upload.onprogress = function (e) {
+            if (e.lengthComputable) {
+                var percent = Math.round((e.loaded / e.total) * 100);
+                fill.style.width = percent + '%';
+                pct.textContent = percent + '%';
+            }
+        };
+        xhr.onload = function () {
+            var result = {};
+            try { result = JSON.parse(xhr.responseText); } catch (err) { /* ignore */ }
+            var ok = (xhr.status === 200 || xhr.status === 207) && result.saved && result.saved.length;
+            if (ok) {
+                item.classList.add('done');
+                status.textContent = '✅ Hochgeladen als ' + result.saved[0];
+                anySuccess = true;
+            } else {
+                item.classList.add('error');
+                var msg = (result.errors && result.errors[0]) || result.error || ('Fehler ' + xhr.status);
+                status.textContent = '❌ ' + msg;
+            }
+            finishOne();
+        };
+        xhr.onerror = function () {
+            item.classList.add('error');
+            status.textContent = '❌ Netzwerkfehler beim Upload';
+            finishOne();
+        };
+        xhr.send(formData);
+    }
+
+    function finishOne() {
+        pendingUploads--;
+        if (pendingUploads <= 0 && anySuccess) {
+            setTimeout(function () { location.reload(); }, 700);
+        }
+    }
+
+    function pandoraNotify(text, isError) {
+        var item = document.createElement('div');
+        item.className = 'upload-item' + (isError ? ' error' : '');
+        var status = document.createElement('div');
+        status.className = 'upload-status';
+        status.textContent = text;
+        item.appendChild(status);
+        panel.appendChild(item);
+        setTimeout(function () { item.remove(); }, 6000);
+    }
+})();
 """
 
 

@@ -16,6 +16,12 @@ HTTP-Datei-Server. Kompatibel mit **Windows** und **Linux**.
   aufklappbarer Ordnerbaum links, Kachel-/Listenansicht rechts mit
   Datei-Icons, Größe, Änderungsdatum, Sortierung, Breadcrumb und Live-Filter
   (Dark-Red-Cyberpunk-Theme, siehe `pandora_web_ui_server.py`)
+- ⬆️ **Drag & Drop-Upload:** Dateien vom Client-PC direkt per Ziehen ins
+  Browserfenster in den aktuell angezeigten Ordner hochladen –
+  Fortschrittsbalken pro Datei, automatischer Kollisionsschutz
+  (`name (1).ext` statt Überschreiben), Größenlimit 2 GiB pro Anfrage,
+  gezogene Ordner werden erkannt und mit Hinweis übersprungen (nur
+  einzelne Dateien werden unterstützt)
 - ⚙️ **Einstellungen → Netzwerk:** Standard-Serverbindung per Radiobutton
   wählbar - „Alle Netzwerke (0.0.0.0)“ oder „Nur dieser Rechner (127.0.0.1)“;
   wird gespeichert und beim nächsten Start automatisch vorausgefüllt (eine
