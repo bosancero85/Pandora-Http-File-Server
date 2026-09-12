@@ -48,13 +48,6 @@ server_worker.py           → QThread + subprocess (startet pandora_web_ui_serv
 pandora_web_ui_server.py   → eigenständiger HTTP-Server mit Explorer-Web-UI
 ```
 
-Die Trennung von GUI und Worker-Logik sorgt dafür, dass die
-Oberfläche während des Serverbetriebs stets reaktionsfähig bleibt.
-`server_worker.py` startet `pandora_web_ui_server.py` als Subprozess -
-exakt wie zuvor `python -m http.server`, nur mit eigenem Handler statt
-dem Standardmodul. Downloads, Range-Requests und MIME-Erkennung laufen
-weiterhin über die geerbte `SimpleHTTPRequestHandler`-Logik inkl. deren
-eingebautem Schutz vor Pfad-Traversal (`../`).
 
 ## 📄 Lizenz
 
